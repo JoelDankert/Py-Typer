@@ -20,7 +20,12 @@ ROOT = Path(__file__).resolve().parent
 EXTENSION_ROOT = ROOT / "animalese_extension_dump" / "unpacked"
 ASSETS_ROOT = EXTENSION_ROOT / "assets" / "audio"
 LOCALE_FILE = EXTENSION_ROOT / "_locales" / "en" / "messages.json"
-DEBUG = True
+SOUND_CACHE_VERSION = "v3"
+CLICK_FADE_SECONDS = 0.003
+CLICK_FADE_MS = max(1, int(CLICK_FADE_SECONDS * 1000))
+MIXER_FREQUENCY = 44100
+MIXER_BUFFER = 4096
+VOLUME_VARIATION = 0.08
 
 FEMALE_LABELS = ["Sweet", "Peppy", "Big sister", "Snooty"]
 MALE_LABELS = ["Jock", "Lazy", "Smug", "Cranky"]
@@ -65,9 +70,7 @@ REVERSE_PHONETIC_MAP = {
 
 @dataclass
 class SoundProfile:
-    pitch_shift: float = 0.0
-    pitch_variation: float = 0.02
-    intonation: float = 0.0
+    pass
 
 
 @dataclass
@@ -84,13 +87,25 @@ class AudioEngine:
         self.extension_root = extension_root
         self.config = config
         self.lock = threading.Lock()
-        self.cache_dir = ROOT / ".sound_cache"
+        self.cache_dir = ROOT / f".sound_cache_{SOUND_CACHE_VERSION}"
         self.cache_dir.mkdir(exist_ok=True)
-        pygame.mixer.pre_init(frequency=48000, size=-16, channels=2, buffer=512)
-        pygame.mixer.init()
+        pygame.mixer.pre_init(
+            frequency=MIXER_FREQUENCY,
+            size=-16,
+            channels=2,
+            buffer=MIXER_BUFFER,
+            allowedchanges=pygame.AUDIO_ALLOW_ANY_CHANGE,
+        )
+        pygame.mixer.init(
+            frequency=MIXER_FREQUENCY,
+            size=-16,
+            channels=2,
+            buffer=MIXER_BUFFER,
+            allowedchanges=pygame.AUDIO_ALLOW_ANY_CHANGE,
+        )
         pygame.mixer.set_num_channels(32)
         self.cutoff_channels: dict[int, pygame.mixer.Channel] = {}
-        self.sound_cache: dict[Path, pygame.mixer.Sound] = {}
+        self.sound_cache: dict[tuple[Path, int], pygame.mixer.Sound] = {}
 
     def cleanup(self) -> None:
         with self.lock:
@@ -107,23 +122,16 @@ class AudioEngine:
         use_profile: bool = False,
     ) -> None:
         if not relative_path:
-            debug("skip: empty audio path")
             return
 
         file_path = self.extension_root / f"{relative_path}.aac"
         if not file_path.exists():
-            debug(f"missing audio file: {file_path}")
             return
 
-        profile = self.config.profile
         detune_cents = 0.0
-        if use_profile or random_pitch or pitch:
-            detune_cents = (profile.pitch_shift + pitch) * 100.0 if use_profile else pitch * 100.0
-            spread = (profile.pitch_variation if use_profile else 0.0) + random_pitch
-            detune_cents += random.uniform(-300.0, 300.0) * spread
 
-        actual_volume = max(0.0, min(2.0, volume * self.config.volume * 0.95))
-        debug(f"play key file={file_path} volume={actual_volume:.3f} detune={detune_cents:.2f}")
+        volume_scale = 1.0 + random.uniform(-VOLUME_VARIATION, VOLUME_VARIATION)
+        actual_volume = max(0.0, min(2.0, volume * self.config.volume * 0.95 * volume_scale))
 
         with self.lock:
             sound = self._load_sound(file_path, detune_cents)
@@ -131,7 +139,7 @@ class AudioEngine:
                 return
             channel = self._get_channel(cutoff_channel)
             channel.set_volume(actual_volume)
-            channel.play(sound)
+            channel.play(sound, fade_ms=CLICK_FADE_MS)
 
     def _get_channel(self, cutoff_channel: int) -> pygame.mixer.Channel:
         if cutoff_channel:
@@ -140,7 +148,7 @@ class AudioEngine:
                 channel = pygame.mixer.Channel(cutoff_channel - 1)
                 self.cutoff_channels[cutoff_channel] = channel
             else:
-                channel.stop()
+                channel.fadeout(CLICK_FADE_MS)
             return channel
 
         channel = pygame.mixer.find_channel(force=True)
@@ -149,21 +157,27 @@ class AudioEngine:
         return channel
 
     def _load_sound(self, file_path: Path, detune_cents: float) -> pygame.mixer.Sound | None:
+        cache_key = (file_path, int(round(detune_cents)))
         if abs(detune_cents) < 0.01:
-            cached = self.sound_cache.get(file_path)
+            cached = self.sound_cache.get(cache_key)
             if cached is not None:
                 return cached
             wav_path = self._cached_wav_path(file_path)
             if not wav_path.exists() and not self._convert_to_wav(file_path, wav_path):
                 return None
             sound = pygame.mixer.Sound(str(wav_path))
-            self.sound_cache[file_path] = sound
+            self.sound_cache[cache_key] = sound
             return sound
 
+        cached = self.sound_cache.get(cache_key)
+        if cached is not None:
+            return cached
         wav_bytes = self._render_shifted_wav(file_path, detune_cents)
         if wav_bytes is None:
             return None
-        return pygame.mixer.Sound(buffer=wav_bytes)
+        sound = pygame.mixer.Sound(buffer=wav_bytes)
+        self.sound_cache[cache_key] = sound
+        return sound
 
     def _cached_wav_path(self, file_path: Path) -> Path:
         rel = file_path.relative_to(self.extension_root)
@@ -171,6 +185,8 @@ class AudioEngine:
 
     def _convert_to_wav(self, file_path: Path, wav_path: Path) -> bool:
         wav_path.parent.mkdir(parents=True, exist_ok=True)
+        duration = self._probe_duration(file_path)
+        filters = self._build_fade_filters(duration)
         cmd = [
             "ffmpeg",
             "-y",
@@ -178,20 +194,25 @@ class AudioEngine:
             "error",
             "-i",
             str(file_path),
+            "-af",
+            filters,
             "-ar",
-            "48000",
+            str(MIXER_FREQUENCY),
             str(wav_path),
         ]
-        debug(f"decode cache cmd={' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            debug(f"ffmpeg decode failed: {result.stderr.strip()}")
             return False
         return True
 
     def _render_shifted_wav(self, file_path: Path, detune_cents: float) -> bytes | None:
         factor = 2 ** (detune_cents / 1200.0)
-        filters = [f"asetrate=48000*{factor:.6f}", "aresample=48000"]
+        duration = self._probe_duration(file_path)
+        filters = [
+            f"asetrate={MIXER_FREQUENCY}*{factor:.6f}",
+            f"aresample={MIXER_FREQUENCY}",
+            *self._build_fade_filter_parts(duration),
+        ]
         cmd = [
             "ffmpeg",
             "-loglevel",
@@ -204,13 +225,43 @@ class AudioEngine:
             "wav",
             "-",
         ]
-        debug(f"render shifted cmd={' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True)
         if result.returncode != 0:
-            stderr = result.stderr.decode(errors="replace").strip()
-            debug(f"ffmpeg render failed: {stderr}")
             return None
         return result.stdout
+
+    def _probe_duration(self, file_path: Path) -> float | None:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(file_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+        try:
+            return float(result.stdout.strip())
+        except ValueError:
+            return None
+
+    def _build_fade_filters(self, duration: float | None) -> str:
+        return ",".join(self._build_fade_filter_parts(duration))
+
+    def _build_fade_filter_parts(self, duration: float | None) -> list[str]:
+        fade = CLICK_FADE_SECONDS
+        if duration is not None:
+            fade = min(CLICK_FADE_SECONDS, max(duration / 4.0, 0.0))
+
+        filters = [f"afade=t=in:st=0:d={fade:.6f}"]
+        if duration is not None and duration > 0:
+            out_start = max(duration - fade, 0.0)
+            filters.append(f"afade=t=out:st={out_start:.6f}:d={fade:.6f}")
+        return filters
 
 
 class AnimaleseTyper:
@@ -241,12 +292,9 @@ class AnimaleseTyper:
             self.audio.cleanup()
 
     def _handle_key_event(self, key: pynput_keyboard.Key | pynput_keyboard.KeyCode) -> None:
-        debug(f"key event raw={key!r}")
         resolved = resolve_key(key)
         if not resolved:
-            debug("key ignored: unresolved")
             return
-        debug(f"resolved key={resolved!r}")
         self._process_key(resolved)
 
     def _process_key(self, key: str) -> None:
@@ -344,11 +392,6 @@ def resolve_key(key: pynput_keyboard.Key | pynput_keyboard.KeyCode) -> str | Non
     return special_map.get(key)
 
 
-def debug(message: str) -> None:
-    if DEBUG:
-        print(f"[debug] {message}", flush=True)
-
-
 def get_letter_sound(key: str) -> str | None:
     if len(key) != 1:
         return None
@@ -425,20 +468,12 @@ def build_config() -> AppConfig:
     )
 
     volume = ask_float("Volume 0.0-1.0", 0.5)
-    pitch_variation = ask_float("Pitch variation", 0.02)
-    pitch_shift = ask_float("Pitch shift", 0.0)
-    intonation = ask_float("Intonation", 0.0)
-
     config = AppConfig(
         gender=gender,
         voice_type=f"voice_{voice_choice}",
         volume=volume,
         sound_config={"1": 0, "2": 1, "3": 2}[mode_choice],
-        profile=SoundProfile(
-            pitch_shift=pitch_shift,
-            pitch_variation=pitch_variation,
-            intonation=intonation,
-        ),
+        profile=SoundProfile(),
     )
 
     print()
@@ -447,9 +482,6 @@ def build_config() -> AppConfig:
     print(f"  Voice: {labels[int(voice_choice) - 1]} ({config.voice_type})")
     print(f"  Mode: {MODE_LABELS[config.sound_config]}")
     print(f"  Volume: {config.volume}")
-    print(f"  Pitch variation: {config.profile.pitch_variation}")
-    print(f"  Pitch shift: {config.profile.pitch_shift}")
-    print(f"  Intonation: {config.profile.intonation}")
     input("Press Enter to start...")
     return config
 
